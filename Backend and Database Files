@@ -1,0 +1,272 @@
+// /backend/prisma/schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Company {
+  id        String    @id @default(cuid())
+  name      String
+  apiKey    String    @unique
+  users     User[]
+  products  Product[]
+  createdAt DateTime  @default(now())
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String   // hashed
+  role      String   // "admin" | "member"
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+  createdAt DateTime @default(now())
+}
+
+model Product {
+  id        String          @id @default(cuid())
+  companyId String
+  company   Company         @relation(fields: [companyId], references: [id])
+  name      String
+  category  String
+  metadata  Json
+  answers   ProductAnswer[]
+  reports   Report[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+}
+
+model QuestionBank {
+  id          String         @id @default(cuid())
+  category    String         // e.g., "Cosmetics", "Food", "Electronics"
+  text        String
+  key         String         // e.g., "ingredients.parabens"
+  type        String         // "text"|"number"|"select"|"multiselect"|"boolean"
+  conditions  Json?          // rules to show conditionally
+  weight      Int            // for scoring
+  createdAt   DateTime       @default(now())
+}
+
+model ProductAnswer {
+  id         String         @id @default(cuid())
+  productId  String
+  product    Product        @relation(fields: [productId], references: [id])
+  questionId String?
+  question   QuestionBank?  @relation(fields: [questionId], references: [id])
+  key        String
+  value      Json
+  createdAt  DateTime       @default(now())
+}
+
+model Report {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  html      String   // stored snapshot (for reproducibility)
+  pdfUrl    String?
+  score     Int?
+  createdAt DateTime @default(now())
+}
+
+
+// /backend/src/services/db.ts
+import { PrismaClient } from '@prisma/client';
+export const prisma = new PrismaClient();
+
+
+// /backend/src/services/pdf.ts
+import puppeteer from "puppeteer";
+
+export async function htmlToPdf(html: string): Promise<Buffer> {
+  const browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
+  const page = await browser.newPage();
+  await page.setContent(html, { waitUntil: "networkidle0" });
+  const pdf = await page.pdf({ format: "A4", printBackground: true });
+  await browser.close();
+  return pdf;
+}
+
+
+// /backend/src/app.ts
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import authRouter from "./routes/auth";
+import productsRouter from "./routes/products";
+import questionsRouter from "./routes/questions";
+import reportsRouter from "./routes/reports";
+
+const app = express();
+
+app.use(helmet());
+app.use(cors({ origin: process.env.FRONTEND_ORIGIN, credentials: true }));
+app.use(express.json({ limit: "2mb" }));
+
+app.use("/auth", authRouter);
+app.use("/products", productsRouter);
+app.use("/questions", questionsRouter);
+app.use("/reports", reportsRouter);
+
+app.get("/health", (_, res) => res.json({ ok: true }));
+app.listen(process.env.PORT || 4000, () => console.log("API up"));
+
+
+// /backend/src/middleware/requireAuth.ts
+import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
+
+export function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const auth = req.headers.authorization?.split(" ")[1];
+  if (!auth) return res.status(401).json({ error: "Missing token" });
+
+  try {
+    const payload = jwt.verify(auth, process.env.JWT_SECRET!) as any;
+    (req as any).user = payload;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+
+// /backend/src/routes/auth.ts
+import { Router } from "express";
+import { prisma } from "../services/db";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+
+const r = Router();
+
+r.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+  const token = jwt.sign({ sub: user.id, companyId: user.companyId, role: user.role }, process.env.JWT_SECRET!, { expiresIn: "7d" });
+  res.json({ token });
+});
+
+export default r;
+
+
+// /backend/src/routes/products.ts
+import { Router } from "express";
+import { prisma } from "../services/db";
+import { requireAuth } from "../middleware/requireAuth";
+
+const r = Router();
+
+r.post("/", requireAuth, async (req, res) => {
+  const { name, category, metadata } = req.body;
+  const product = await prisma.product.create({
+    data: { name, category, metadata, companyId: (req as any).user.companyId }
+  });
+  res.json(product);
+});
+
+r.get("/:id", requireAuth, async (req, res) => {
+  const product = await prisma.product.findFirst({
+    where: { id: req.params.id, companyId: (req as any).user.companyId },
+    include: { answers: true, reports: true }
+  });
+  if (!product) return res.status(404).end();
+  res.json(product);
+});
+
+r.post("/:id/answers", requireAuth, async (req, res) => {
+  const { answers } = req.body as { answers: { key: string; value: any; questionId?: string }[] };
+  const created = await prisma.$transaction(
+    answers.map(a => prisma.productAnswer.create({
+      data: { productId: req.params.id, key: a.key, value: a.value, questionId: a.questionId }
+    }))
+  );
+  res.json({ count: created.length });
+});
+
+export default r;
+
+
+// /backend/src/routes/questions.ts
+import { Router } from "express";
+import fetch from "node-fetch";
+import { requireAuth } from "../middleware/requireAuth";
+
+const r = Router();
+
+r.post("/generate", requireAuth, async (req, res) => {
+  const resp = await fetch(`${process.env.AI_SERVICE_URL}/generate-questions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-company-id": (req as any).user.companyId },
+    body: JSON.stringify(req.body) // { product, answers }
+  });
+  const data = await resp.json();
+  res.json(data); // { questions: Question[] }
+});
+
+export default r;
+
+
+// /backend/src/routes/reports.ts
+import { Router } from "express";
+import { prisma } from "../services/db";
+import { requireAuth } from "../middleware/requireAuth";
+import { htmlToPdf } from "../services/pdf";
+
+const r = Router();
+
+const renderHtml = (product: any, answers: any[], score?: number) => `
+<!doctype html><html><head>
+<meta charset="utf-8" />
+<style>
+ body{font-family: Inter, Arial, sans-serif; padding:24px;}
+ h1{margin:0 0 8px}
+ .badge{padding:4px 8px; border:1px solid #ccc; border-radius:6px;}
+ .grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+ .kv{padding:12px;border:1px solid #eee;border-radius:8px}
+ footer{margin-top:24px;font-size:12px;color:#666}
+</style></head><body>
+<h1>Product Transparency Report</h1>
+<div class="badge">${product.category}</div>
+<h2>${product.name}</h2>
+${score !== undefined ? `<p><strong>Transparency Score:</strong> ${score}/100</p>` : ""}
+<h3>Key Disclosures</h3>
+<div class="grid">
+  ${answers.map(a => `<div class="kv"><strong>${a.key}</strong><div>${formatVal(a.value)}</div></div>`).join("")}
+</div>
+<footer>Generated on ${new Date().toISOString()}</footer>
+</body></html>`;
+
+function formatVal(v: any) {
+  if (typeof v === 'object') return `<pre>${JSON.stringify(v, null, 2)}</pre>`;
+  return String(v);
+}
+
+r.post("/:productId", requireAuth, async (req, res) => {
+  const { productId } = req.params;
+  const { score } = req.body as { score?: number };
+
+  const product = await prisma.product.findFirst({
+    where: { id: productId, companyId: (req as any).user.companyId },
+    include: { answers: true }
+  });
+  if (!product) return res.status(404).end();
+
+  const html = renderHtml(product, product.answers, score);
+  const rec = await prisma.report.create({ data: { productId, html, score } });
+
+  const pdf = await htmlToPdf(html);
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename=report-${rec.id}.pdf`);
+  res.send(pdf);
+});
+
+export default r;
+
