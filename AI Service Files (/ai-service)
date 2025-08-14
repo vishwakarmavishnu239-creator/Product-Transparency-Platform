@@ -1,0 +1,70 @@
+# /ai-service/requirements.txt
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.8.2
+scikit-learn==1.5.1
+transformers==4.43.3
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+
+# /ai-service/main.py
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+app = FastAPI(title="Altibbe AI Microservice")
+
+class QA(BaseModel):
+    key: str
+    value: Any
+
+class GenerateBody(BaseModel):
+    product: Dict[str, Any]  # {name, category, metadata}
+    answers: List[QA] = []
+
+RISKY_KEYS = {
+    "Food": ["ingredients.allergens", "sourcing.country", "certifications.organic"],
+    "Cosmetics": ["ingredients.parabens", "fragrance.disclosure", "animal_testing"],
+    "Electronics": ["battery.composition", "warranty.length", "repairability.index"]
+}
+
+def rules_engine(product, answers):
+    seen = {a.key for a in answers}
+    base = RISKY_KEYS.get(product.get("category"), [])
+    followups = [k for k in base if k not in seen]
+    # add conditional probes
+    if any(a.key=="ingredients.parabens" and a.value==True for a in answers):
+        followups.append("ingredients.paraben_types")
+    return followups
+
+@app.post("/generate-questions")
+async def generate_questions(body: GenerateBody):
+    product = body.product
+    follow = rules_engine(product, body.answers)
+    # LLM-style shape (you can swap this to a real LLM later)
+    questions = []
+    for key in follow:
+        q = {
+            "key": key,
+            "text": key.replace(".", " ").title() + "?",
+            "type": "text" if key.endswith("types") else "boolean" if "testing" in key else "text",
+            "options": None
+        }
+        questions.append(q)
+    return {"questions": questions}
+
+class ScoreBody(BaseModel):
+    product: Dict[str, Any]
+    answers: List[QA] = []
+
+@app.post("/transparency-score")
+async def transparency_score(body: ScoreBody):
+    # naive example: more disclosures + risk mitigations => higher score
+    base = 50
+    disclosed = len(body.answers)
+    penalties = 0
+    for a in body.answers:
+        if a.key.endswith("animal_testing") and a.value == True: penalties += 15
+        if a.key.endswith("parabens") and a.value == True: penalties += 10
+    score = max(0, min(100, base + disclosed*3 - penalties))
+    return {"score": score}
