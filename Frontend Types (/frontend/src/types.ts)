@@ -1,0 +1,21 @@
+// /frontend/src/types.ts
+export type Question = {
+  key: string;
+  text: string;
+  type: "text" | "number" | "select" | "multiselect" | "boolean";
+  options?: string[];
+};
+
+export type Answer = {
+  key: string;
+  value: any;
+  questionId?: string;
+};
+
+export type Product = {
+  id: string;
+  name: string;
+  category: string;
+  metadata: any;
+};
+
